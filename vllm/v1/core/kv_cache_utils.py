@@ -2309,6 +2309,16 @@ def update_kv_cache_capacity(
     vllm_config.cache_config.kv_cache_size_tokens = num_tokens
     vllm_config.cache_config.kv_cache_max_concurrency = max_concurrency
     max_model_len = vllm_config.model_config.max_model_len
+    concurrency = vllm_config.cache_config.concurrency
+    if concurrency is not None:
+        logger.info_once(
+            "GPU KV cache size: %s tokens, sized for %d concurrent request(s) "
+            "of %s tokens each",
+            f"{num_tokens:,}",
+            concurrency,
+            f"{max_model_len:,}",
+        )
+        return
     logger.info_once(
         "GPU KV cache size: %s tokens, "
         "Maximum concurrency for %s tokens per request: %.2fx",
@@ -2515,6 +2525,62 @@ def _project_kv_cache_groups_to_worker(
     return projected_groups
 
 
+def _cap_memory_to_concurrency(
+    vllm_config: VllmConfig,
+    projected_groups_per_worker: list[list[KVCacheGroupSpec]],
+    available_memory: list[int],
+    concurrency: int,
+) -> list[int]:
+    """
+    Shrink each worker's KV cache budget to exactly what `concurrency` requests
+    at `max_model_len` occupy, plus the null block the BlockPool holds back.
+
+    Profiling hands back everything `gpu_memory_utilization` allows, which the
+    pool would otherwise turn into blocks no request can ever use once
+    `max_num_seqs` is pinned to the same value. The surplus is left unallocated.
+
+    Args:
+        vllm_config: The global VllmConfig.
+        projected_groups_per_worker: KV cache groups projected to each worker.
+        available_memory: Memory available for KV cache in bytes for each worker.
+        concurrency: Number of requests the cache must hold at max_model_len.
+
+    Returns:
+        The capped per-worker memory budgets.
+    """
+    capped_memory: list[int] = []
+    for groups, avail_mem in zip(projected_groups_per_worker, available_memory):
+        if not groups:
+            capped_memory.append(avail_mem)
+            continue
+        needed = concurrency * _max_memory_usage_bytes_from_groups(
+            vllm_config, groups
+        ) + _pool_bytes_per_block(groups)
+        if needed < avail_mem:
+            logger.info(
+                "Sizing KV cache for concurrency=%d: %s GiB instead of the "
+                "%s GiB available. The rest is left unallocated.",
+                concurrency,
+                format_gib(needed),
+                format_gib(avail_mem),
+            )
+        elif needed > avail_mem:
+            per_request = _max_memory_usage_bytes_from_groups(vllm_config, groups)
+            fits = (avail_mem - _pool_bytes_per_block(groups)) // per_request
+            logger.warning(
+                "concurrency=%d needs %s GiB of KV cache but only %s GiB is "
+                "available. %d request(s) fit at max_model_len; the rest will "
+                "be preempted or queued. Lower concurrency or max_model_len, "
+                "or free GPU memory.",
+                concurrency,
+                format_gib(needed),
+                format_gib(avail_mem),
+                fits,
+            )
+        capped_memory.append(min(avail_mem, needed))
+    return capped_memory
+
+
 def get_kv_cache_configs(
     vllm_config: VllmConfig,
     kv_cache_specs: list[dict[str, KVCacheSpec]],
@@ -2625,8 +2691,25 @@ def get_kv_cache_configs(
         for groups, avail_mem in zip(projected_groups_per_worker, available_memory)
     ]
 
+    concurrency = vllm_config.cache_config.concurrency
     if vllm_config.model_config.original_max_model_len == -1:
-        _auto_fit_max_model_len(vllm_config, projected_groups_per_worker, check_memory)
+        # Each of the `concurrency` requests gets an equal share, so all of them
+        # fit at the fitted length rather than only the first one.
+        fit_memory = (
+            check_memory
+            if concurrency is None
+            else [avail_mem // concurrency for avail_mem in check_memory]
+        )
+        _auto_fit_max_model_len(vllm_config, projected_groups_per_worker, fit_memory)
+
+    if concurrency is not None:
+        available_memory = _cap_memory_to_concurrency(
+            vllm_config, projected_groups_per_worker, available_memory, concurrency
+        )
+        check_memory = [
+            avail_mem - _pool_bytes_per_block(groups) if groups else avail_mem
+            for groups, avail_mem in zip(projected_groups_per_worker, available_memory)
+        ]
 
     # Check if the available memory is enough per worker.
     for groups, avail_mem in zip(projected_groups_per_worker, check_memory):

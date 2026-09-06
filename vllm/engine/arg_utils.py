@@ -630,6 +630,7 @@ class EngineArgs:
 
     ray_workers_use_nsight: bool = ParallelConfig.ray_workers_use_nsight
     num_gpu_blocks_override: int | None = CacheConfig.num_gpu_blocks_override
+    concurrency: int | None = CacheConfig.concurrency
     model_loader_extra_config: dict = get_field(LoadConfig, "model_loader_extra_config")
     ignore_patterns: str | list[str] = get_field(LoadConfig, "ignore_patterns")
 
@@ -1249,6 +1250,7 @@ class EngineArgs:
         cache_group.add_argument(
             "--num-gpu-blocks-override", **cache_kwargs["num_gpu_blocks_override"]
         )
+        cache_group.add_argument("--concurrency", **cache_kwargs["concurrency"])
         cache_group.add_argument(
             "--enable-prefix-caching",
             **{
@@ -2051,6 +2053,7 @@ class EngineArgs:
             cache_dtype=resolved_cache_dtype,  # type: ignore[arg-type]
             is_attention_free=model_config.is_attention_free,
             num_gpu_blocks_override=self.num_gpu_blocks_override,
+            concurrency=self.concurrency,
             sliding_window=sliding_window,
             enable_prefix_caching=self.enable_prefix_caching,
             prefix_caching_hash_algo=self.prefix_caching_hash_algo,
@@ -2834,6 +2837,17 @@ class EngineArgs:
             default_max_num_batched_tokens,
             default_max_num_seqs,
         ) = self.get_batch_defaults(world_size)
+
+        if self.concurrency is not None:
+            if self.max_num_seqs is not None and self.max_num_seqs != self.concurrency:
+                raise ValueError(
+                    f"concurrency ({self.concurrency}) and max_num_seqs "
+                    f"({self.max_num_seqs}) both cap the number of running "
+                    "requests. Pass only one of them."
+                )
+            # Explicit, so neither the usage-context default nor the throughput
+            # doubling below can raise it.
+            self.max_num_seqs = self.concurrency
 
         orig_max_num_batched_tokens = self.max_num_batched_tokens
         orig_max_num_seqs = self.max_num_seqs

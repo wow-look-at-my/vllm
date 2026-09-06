@@ -133,6 +133,16 @@ class CacheConfig:
     num_gpu_blocks_override: int | None = None
     """Number of GPU blocks to use. This overrides the profiled `num_gpu_blocks`
     if specified. Does nothing if `None`. Used for testing preemption."""
+    concurrency: int | None = Field(default=None, ge=1)
+    """Number of concurrent requests to size the engine for. `1` serves a
+    single stream.
+
+    Sets `max_num_seqs` to the same value and allocates only the KV cache those
+    requests need at `max_model_len`, instead of filling
+    `gpu_memory_utilization`. The freed GPU memory is left unallocated.
+
+    Mutually exclusive with `num_gpu_blocks_override` and
+    `kv_cache_memory_bytes`, which set the KV cache size directly."""
     sliding_window: int | None = None
     """Sliding window size for the KV cache. This is primarily set in
     `ModelConfig` and that value should be manually duplicated here."""
@@ -269,6 +279,7 @@ class CacheConfig:
             "kv_cache_memory_bytes",
             "is_attention_free",
             "num_gpu_blocks_override",
+            "concurrency",
             "enable_prefix_caching",
             "prefix_caching_hash_algo",
             "prefix_cache_retention_interval",
@@ -321,6 +332,23 @@ class CacheConfig:
             self.user_specified_block_size = True
         if self.mamba_block_size is not None:
             self.user_specified_mamba_block_size = True
+        return self
+
+    @model_validator(mode="after")
+    def _validate_concurrency(self) -> "CacheConfig":
+        if self.concurrency is None:
+            return self
+        conflicting = [
+            name
+            for name in ("num_gpu_blocks_override", "kv_cache_memory_bytes")
+            if getattr(self, name) is not None
+        ]
+        if conflicting:
+            raise ValueError(
+                f"concurrency={self.concurrency} sizes the KV cache, so it "
+                f"cannot be combined with {' and '.join(conflicting)}. Pass "
+                "only one of them."
+            )
         return self
 
     @field_validator("mamba_cache_mode", mode="after")

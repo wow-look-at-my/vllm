@@ -2150,6 +2150,52 @@ def test_get_kv_cache_configs_attention_free():
     ]
 
 
+@pytest.mark.parametrize("concurrency", [1, 4])
+def test_get_kv_cache_configs_concurrency_caps_allocation(concurrency):
+    """`concurrency` allocates for exactly that many requests at
+    max_model_len, leaving the rest of the profiled memory unused."""
+    model_config = ModelConfig(max_model_len=512)
+    vllm_config = VllmConfig(model_config=model_config)
+    vllm_config.cache_config.kv_cache_layout = "LBNHC"
+    vllm_config.cache_config.prefix_cache_retention_interval = None
+
+    ref_kv_cache_spec = new_kv_cache_spec()
+    kv_cache_specs = {"layer1": ref_kv_cache_spec}
+    blocks_per_request = model_config.max_model_len // ref_kv_cache_spec.block_size
+    # Far more memory than any of the tested concurrencies needs.
+    available_memory = ref_kv_cache_spec.page_size_bytes * blocks_per_request * 100
+
+    configs = get_kv_cache_configs(vllm_config, [kv_cache_specs], [available_memory])
+    assert configs[0].num_blocks == blocks_per_request * 100
+
+    vllm_config.cache_config.concurrency = concurrency
+    capped = get_kv_cache_configs(vllm_config, [kv_cache_specs], [available_memory])[0]
+    # The extra block is the null block the BlockPool holds back.
+    assert capped.num_blocks == concurrency * blocks_per_request + 1
+    assert capped.kv_cache_tensors[0].size == (
+        ref_kv_cache_spec.page_size_bytes * capped.num_blocks
+    )
+
+
+def test_get_kv_cache_configs_concurrency_keeps_smaller_memory(caplog_vllm):
+    """A budget below the concurrency target is left alone, and says so."""
+    model_config = ModelConfig(max_model_len=512)
+    vllm_config = VllmConfig(model_config=model_config)
+    vllm_config.cache_config.kv_cache_layout = "LBNHC"
+    vllm_config.cache_config.prefix_cache_retention_interval = None
+    vllm_config.cache_config.concurrency = 8
+
+    ref_kv_cache_spec = new_kv_cache_spec()
+    blocks_per_request = model_config.max_model_len // ref_kv_cache_spec.block_size
+    available_memory = ref_kv_cache_spec.page_size_bytes * (blocks_per_request + 1)
+
+    kv_cache_config = get_kv_cache_configs(
+        vllm_config, [{"layer1": ref_kv_cache_spec}], [available_memory]
+    )[0]
+    assert kv_cache_config.num_blocks == blocks_per_request + 1
+    assert "1 request(s) fit at max_model_len" in caplog_vllm.text
+
+
 def test_generate_uniform_type_kv_cache_specs():
     # All layers are full attention, can be merged
     kv_cache_specs = {
