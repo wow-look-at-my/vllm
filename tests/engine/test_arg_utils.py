@@ -507,6 +507,32 @@ def test_prefix_cache_default():
     assert engine_args.prefix_cache_retention_interval == 64
 
 
+def test_concurrency_pins_max_num_seqs():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(["--model", "facebook/opt-125m", "--concurrency", "1"])
+    vllm_config = EngineArgs.from_cli_args(args).create_engine_config()
+
+    assert vllm_config.cache_config.concurrency == 1
+    assert vllm_config.scheduler_config.max_num_seqs == 1
+
+
+@pytest.mark.parametrize(
+    "conflicting_args",
+    [
+        ["--max-num-seqs", "8"],
+        ["--num-gpu-blocks-override", "16"],
+        ["--kv-cache-memory-bytes", "1024"],
+    ],
+)
+def test_concurrency_rejects_conflicting_sizing_args(conflicting_args):
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(
+        ["--model", "facebook/opt-125m", "--concurrency", "2", *conflicting_args]
+    )
+    with pytest.raises(ValueError, match="only one of them"):
+        EngineArgs.from_cli_args(args).create_engine_config()
+
+
 def test_prefix_cache_retention_interval_from_deprecated_env(
     monkeypatch, caplog, disable_log_dedup
 ):

@@ -46,6 +46,20 @@ You can monitor the number of preemption requests through Prometheus metrics exp
 
 In vLLM V1, the default preemption mode is `RECOMPUTE` rather than `SWAP`, as recomputation has lower overhead in the V1 architecture.
 
+## Sizing for a Fixed Number of Streams
+
+By default vLLM claims `gpu_memory_utilization` of the GPU. It turns everything left after the model into KV cache. The KV cache then holds a fractional number of requests at `max_model_len`. This is the `Maximum concurrency ... 1.32x` line at startup.
+
+`--concurrency N` sizes the engine for exactly `N` requests instead:
+
+```bash
+vllm serve meta-llama/Llama-3.1-8B-Instruct --concurrency 1
+```
+
+This sets `max_num_seqs` to `N`. It allocates only the KV cache that `N` requests at `max_model_len` need. vLLM never allocates the remaining GPU memory. That memory stays free for another process on the same GPU. Requests beyond `N` queue instead of running.
+
+`--concurrency` cannot be combined with `--max-num-seqs`, `--num-gpu-blocks-override`, or `--kv-cache-memory-bytes`. Each of those sets the same limits directly. With `--max-model-len -1`, the auto-fitted context length is the largest length that fits `N` concurrent requests.
+
 ## Chunked Prefill
 
 Chunked prefill allows vLLM to process large prefills in smaller chunks and batch them together with decode requests. This feature helps improve both throughput and latency by better balancing compute-bound (prefill) and memory-bound (decode) operations.
