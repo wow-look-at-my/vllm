@@ -1,0 +1,52 @@
+name: fork-ci
+
+# Upstream's workflows are gated on repository_owner == 'vllm-project' and target its self-hosted pool, so a fork gets no checks.
+
+on:
+  push:
+    branches: ['**']
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    if: github.repository_owner != 'vllm-project'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install uv
+        run: curl -LsSf https://astral.sh/uv/install.sh | sh
+      - name: Create environment
+        run: |
+          uv venv --python 3.12
+          uv pip install -r requirements/lint.txt
+      - name: Run pre-commit
+        run: .venv/bin/pre-commit run --all-files --hook-stage manual
+
+  tests:
+    if: github.repository_owner != 'vllm-project'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install uv
+        run: curl -LsSf https://astral.sh/uv/install.sh | sh
+      - name: Install vLLM and test dependencies
+        env:
+          VLLM_USE_PRECOMPILED: 1
+        run: |
+          uv venv --python 3.12
+          uv pip install -e . --torch-backend=cpu
+          uv pip install -r requirements/test/cuda.in
+          # The torchcodec wheel links the CUDA build of torch, so it fails to load next to the CPU build.
+          uv pip uninstall torchcodec
+      - name: Run config and KV cache tests
+        run: |
+          .venv/bin/pytest tests/v1/core/test_kv_cache_utils.py \
+            tests/engine/test_arg_utils.py -q
